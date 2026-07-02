@@ -11,7 +11,6 @@ const {
   DISCORD_WEBHOOK,
 
   YOUTUBE_API_KEY,
-  YOUTUBE_CHANNEL_ID,
   YOUTUBE_SEARCH_QUERY,
   YOUTUBE_MIN_DATE,
   YOUTUBE_BOOTSTRAP_SILENT,
@@ -34,7 +33,7 @@ const YOUTUBE_MIN_DATE_VALUE = new Date(
   YOUTUBE_MIN_DATE || "2026-06-24T00:00:00.000Z"
 );
 
-const YOUTUBE_BOOTSTRAP_SILENT_VALUE = YOUTUBE_BOOTSTRAP_SILENT !== "false";
+const YOUTUBE_BOOTSTRAP_SILENT_VALUE = YOUTUBE_BOOTSTRAP_SILENT === "true";
 const YOUTUBE_CHECK_INTERVAL_MINUTES_VALUE = Number(
   YOUTUBE_CHECK_INTERVAL_MINUTES || 60
 );
@@ -119,23 +118,6 @@ function decodeHtmlEntities(text) {
     .replace(/&gt;/g, ">");
 }
 
-function stripCdata(text) {
-  if (!text) return "";
-  return text.replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "");
-}
-
-function extractXmlTag(entry, tagName) {
-  const regex = new RegExp(`<${tagName}[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "i");
-  const match = entry.match(regex);
-  return match ? decodeHtmlEntities(stripCdata(match[1].trim())) : "";
-}
-
-function extractXmlAttribute(entry, tagName, attrName) {
-  const regex = new RegExp(`<${tagName}[^>]*${attrName}="([^"]+)"[^>]*>`, "i");
-  const match = entry.match(regex);
-  return match ? decodeHtmlEntities(match[1]) : "";
-}
-
 function startHealthServer() {
   const port = PORT || 3000;
 
@@ -151,7 +133,13 @@ function startHealthServer() {
 
       if (tickInProgress) {
         res.writeHead(202, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, alreadyRunning: true, status }));
+        res.end(
+          JSON.stringify({
+            ok: true,
+            alreadyRunning: true,
+            status,
+          })
+        );
         return;
       }
 
@@ -170,6 +158,7 @@ function startHealthServer() {
         {
           ok: true,
           message: "Rejected Draft Twitch + YouTube monitor is running.",
+          usage: "/tick?secret=YOUR_TICK_SECRET",
           status,
         },
         null,
@@ -244,7 +233,7 @@ async function sendDiscordEmbed(embed, context = "Discord alert") {
       body: JSON.stringify({ embeds: [embed] }),
     });
 
-    if (res.ok) return;
+    if (res.ok) return true;
 
     const bodyText = await res.text();
 
@@ -295,8 +284,8 @@ async function sendTwitchAlert(stream, isFirstTime) {
       color: isFirstTime ? 15158332 : 5763719,
       thumbnail: {
         url: stream.thumbnail_url
-          .replace("{width}", "320")
-          .replace("{height}", "180"),
+          ? stream.thumbnail_url.replace("{width}", "320").replace("{height}", "180")
+          : undefined,
       },
       fields: [
         { name: "Streamer", value: stream.user_name, inline: true },
@@ -340,86 +329,6 @@ async function checkTwitchStreams() {
   );
 }
 
-async function getRecentYouTubeVideosFromRss() {
-  if (!YOUTUBE_CHANNEL_ID) return [];
-
-  const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(
-    YOUTUBE_CHANNEL_ID
-  )}`;
-
-  const res = await fetch(feedUrl);
-
-  if (!res.ok) {
-    throw new Error(`YouTube RSS error ${res.status}: ${await res.text()}`);
-  }
-
-  const xml = await res.text();
-  const entries = xml.match(/<entry>[\s\S]*?<\/entry>/gi) || [];
-
-  return entries
-    .map((entry) => {
-      const videoId = extractXmlTag(entry, "yt:videoId");
-      const title = extractXmlTag(entry, "title");
-      const channelTitle = extractXmlTag(entry, "name") || "YouTube";
-      const publishedAt = extractXmlTag(entry, "published");
-      const thumbnail = extractXmlAttribute(entry, "media:thumbnail", "url");
-
-      return {
-        videoId,
-        title,
-        channelTitle,
-        publishedAt,
-        thumbnail: thumbnail || null,
-        source: "rss",
-      };
-    })
-    .filter((video) => video.videoId && video.title && video.publishedAt);
-}
-
-async function getRecentYouTubeVideosFromApi() {
-  if (!YOUTUBE_API_KEY) {
-    console.log("Skipping YouTube API fallback: YOUTUBE_API_KEY not set.");
-    return [];
-  }
-
-  const params = new URLSearchParams({
-    part: "snippet",
-    type: "video",
-    order: "date",
-    maxResults: "25",
-    publishedAfter: YOUTUBE_MIN_DATE_VALUE.toISOString(),
-    key: YOUTUBE_API_KEY,
-  });
-
-  if (YOUTUBE_CHANNEL_ID) {
-    params.set("channelId", YOUTUBE_CHANNEL_ID);
-  } else {
-    params.set("q", YOUTUBE_QUERY);
-  }
-
-  const res = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
-
-  if (!res.ok) {
-    throw new Error(`YouTube API search error ${res.status}: ${await res.text()}`);
-  }
-
-  const data = await res.json();
-
-  return (data.items || [])
-    .filter((item) => item.id && item.id.videoId && item.snippet)
-    .map((item) => ({
-      videoId: item.id.videoId,
-      title: decodeHtmlEntities(item.snippet.title || ""),
-      channelTitle: decodeHtmlEntities(item.snippet.channelTitle || "Unknown channel"),
-      publishedAt: item.snippet.publishedAt,
-      thumbnail:
-        item.snippet.thumbnails?.medium?.url ||
-        item.snippet.thumbnails?.default?.url ||
-        null,
-      source: "api",
-    }));
-}
-
 function dedupeVideos(videos) {
   const byId = new Map();
 
@@ -432,25 +341,44 @@ function dedupeVideos(videos) {
 }
 
 async function getRecentYouTubeVideos() {
-  let videos = [];
-
-  if (YOUTUBE_CHANNEL_ID) {
-    try {
-      videos = await getRecentYouTubeVideosFromRss();
-      console.log(`YouTube RSS returned ${videos.length} videos.`);
-    } catch (err) {
-      console.error("YouTube RSS failed:", err);
-    }
+  if (!YOUTUBE_API_KEY) {
+    console.log("Skipping YouTube check: YOUTUBE_API_KEY not set.");
+    return [];
   }
 
-  if (videos.length === 0) {
-    try {
-      videos = await getRecentYouTubeVideosFromApi();
-      console.log(`YouTube API returned ${videos.length} videos.`);
-    } catch (err) {
-      console.error("YouTube API fallback failed:", err);
-    }
+  const params = new URLSearchParams({
+    part: "snippet",
+    q: YOUTUBE_QUERY,
+    type: "video",
+    order: "date",
+    maxResults: "25",
+    publishedAfter: YOUTUBE_MIN_DATE_VALUE.toISOString(),
+    key: YOUTUBE_API_KEY,
+  });
+
+  const res = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
+
+  if (!res.ok) {
+    throw new Error(`YouTube API search error ${res.status}: ${await res.text()}`);
   }
+
+  const data = await res.json();
+
+  const videos = (data.items || [])
+    .filter((item) => item.id && item.id.videoId && item.snippet)
+    .map((item) => ({
+      videoId: item.id.videoId,
+      title: decodeHtmlEntities(item.snippet.title || ""),
+      channelTitle: decodeHtmlEntities(item.snippet.channelTitle || "Unknown channel"),
+      publishedAt: item.snippet.publishedAt,
+      thumbnail:
+        item.snippet.thumbnails?.medium?.url ||
+        item.snippet.thumbnails?.default?.url ||
+        null,
+      source: "youtube-search",
+    }));
+
+  console.log(`YouTube API search returned ${videos.length} videos.`);
 
   return dedupeVideos(videos);
 }
@@ -536,8 +464,7 @@ async function checkYouTubeVideos() {
   ensureFiles();
 
   const seenVideos = readJsonSet(SEEN_YOUTUBE_FILE);
-  const isBootstrap =
-    YOUTUBE_BOOTSTRAP_SILENT_VALUE && seenVideos.size === 0;
+  const isBootstrap = YOUTUBE_BOOTSTRAP_SILENT_VALUE && seenVideos.size === 0;
 
   const videos = await getRecentYouTubeVideos();
 
@@ -545,6 +472,7 @@ async function checkYouTubeVideos() {
   let ignored = 0;
   let bootstrapped = 0;
 
+  // Oldest first, so alerts show in chronological order.
   for (const video of videos.reverse()) {
     if (seenVideos.has(video.videoId)) continue;
 
@@ -577,6 +505,8 @@ async function checkYouTubeVideos() {
       break;
     }
 
+    // Mark seen BEFORE sending so crashes/rate limits do not cause repeated spam.
+    // Tradeoff: if Discord fails permanently, this video may not alert.
     seenVideos.add(video.videoId);
     writeJsonSet(SEEN_YOUTUBE_FILE, seenVideos);
 
@@ -586,6 +516,7 @@ async function checkYouTubeVideos() {
 
     console.log(`YouTube alert sent: ${video.title}`);
 
+    // Avoid bursty Discord webhook rate limits.
     await sleep(1250);
   }
 
@@ -641,8 +572,7 @@ async function main() {
 
   console.log("Rejected Draft Twitch + YouTube monitor started.");
   console.log(`Monitoring Twitch game ID: ${TWITCH_GAME_ID}`);
-  console.log(`Monitoring YouTube channel ID: ${YOUTUBE_CHANNEL_ID || "not set"}`);
-  console.log(`Monitoring YouTube query fallback: ${YOUTUBE_QUERY}`);
+  console.log(`Monitoring YouTube query: ${YOUTUBE_QUERY}`);
   console.log(`YouTube min date: ${YOUTUBE_MIN_DATE_VALUE.toISOString()}`);
   console.log(`YouTube title must contain exact text: ${REQUIRED_YOUTUBE_TITLE_TEXT}`);
   console.log(`YouTube bootstrap silent: ${YOUTUBE_BOOTSTRAP_SILENT_VALUE}`);
