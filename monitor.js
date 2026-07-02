@@ -13,7 +13,6 @@ const {
   YOUTUBE_API_KEY,
   YOUTUBE_SEARCH_QUERY,
   YOUTUBE_MIN_DATE,
-  YOUTUBE_BOOTSTRAP_SILENT,
   YOUTUBE_CHECK_INTERVAL_MINUTES,
 
   TICK_SECRET,
@@ -33,12 +32,9 @@ const YOUTUBE_MIN_DATE_VALUE = new Date(
   YOUTUBE_MIN_DATE || "2026-06-24T00:00:00.000Z"
 );
 
-const YOUTUBE_BOOTSTRAP_SILENT_VALUE = YOUTUBE_BOOTSTRAP_SILENT === "true";
 const YOUTUBE_CHECK_INTERVAL_MINUTES_VALUE = Number(
-  YOUTUBE_CHECK_INTERVAL_MINUTES || 60
+  YOUTUBE_CHECK_INTERVAL_MINUTES || 45
 );
-
-const MAX_YOUTUBE_ALERTS_PER_CHECK = 5;
 
 let twitchToken = null;
 let twitchTokenExpiresAt = 0;
@@ -52,6 +48,7 @@ let status = {
   lastTickError: null,
   lastTwitchCheckAt: null,
   lastYouTubeCheckAt: null,
+  lastYouTubeDigestCount: 0,
 };
 
 function requireEnv(name, value) {
@@ -291,11 +288,13 @@ async function sendTwitchAlert(stream, isFirstTime) {
       ].join("\n"),
       url: streamUrl,
       color: isFirstTime ? 15158332 : 5763719,
-      thumbnail: {
-        url: stream.thumbnail_url
-          ? stream.thumbnail_url.replace("{width}", "320").replace("{height}", "180")
-          : undefined,
-      },
+      thumbnail: stream.thumbnail_url
+        ? {
+            url: stream.thumbnail_url
+              .replace("{width}", "320")
+              .replace("{height}", "180"),
+          }
+        : undefined,
       fields: [
         { name: "Streamer", value: stream.user_name, inline: true },
         { name: "First time?", value: isFirstTime ? "Yes ⭐" : "No", inline: true },
@@ -422,27 +421,51 @@ function shouldIgnoreYouTubeVideo(video) {
   };
 }
 
-async function sendYouTubeAlert(video) {
-  const url = `https://www.youtube.com/watch?v=${video.videoId}`;
+function formatYouTubeDigestDescription(videos) {
+  const lines = [];
 
-  await sendDiscordEmbed(
+  lines.push(`Found **${videos.length}** new YouTube video${videos.length === 1 ? "" : "s"} matching **${REQUIRED_YOUTUBE_TITLE_TEXT}**.`);
+  lines.push("");
+  lines.push(`Cutoff: ${YOUTUBE_MIN_DATE_VALUE.toISOString()}`);
+  lines.push("");
+
+  for (const [index, video] of videos.entries()) {
+    const url = `https://www.youtube.com/watch?v=${video.videoId}`;
+
+    lines.push(`**${index + 1}. ${video.title}**`);
+    lines.push(`Channel: ${video.channelTitle}`);
+    lines.push(`Published: ${video.publishedAt}`);
+    lines.push(url);
+    lines.push("");
+  }
+
+  let description = lines.join("\n");
+
+  if (description.length > 3900) {
+    description =
+      description.slice(0, 3850) +
+      "\n\n...Digest truncated because Discord embed text is too long.";
+  }
+
+  return description;
+}
+
+async function sendYouTubeDigestAlert(videos) {
+  if (videos.length === 0) return false;
+
+  const newestVideo = videos[videos.length - 1];
+  const newestUrl = `https://www.youtube.com/watch?v=${newestVideo.videoId}`;
+
+  return sendDiscordEmbed(
     {
-      title: "📺 New Rejected Draft YouTube video found!",
-      description: [
-        `**${video.title}**`,
-        "",
-        `**Channel:** ${video.channelTitle}`,
-        `**Published:** ${video.publishedAt}`,
-        `**Source:** ${video.source}`,
-        "",
-        url,
-      ].join("\n"),
-      url,
+      title: "📺 New Rejected Draft YouTube videos found",
+      description: formatYouTubeDigestDescription(videos),
+      url: newestUrl,
       color: 16711680,
-      thumbnail: video.thumbnail ? { url: video.thumbnail } : undefined,
+      thumbnail: newestVideo.thumbnail ? { url: newestVideo.thumbnail } : undefined,
       timestamp: new Date().toISOString(),
     },
-    "YouTube Discord alert"
+    "YouTube digest Discord alert"
   );
 }
 
@@ -473,17 +496,19 @@ async function checkYouTubeVideos() {
   ensureFiles();
 
   const seenVideos = readJsonSet(SEEN_YOUTUBE_FILE);
-  const isBootstrap = YOUTUBE_BOOTSTRAP_SILENT_VALUE && seenVideos.size === 0;
-
   const videos = await getRecentYouTubeVideos();
 
-  let alertsSent = 0;
-  let ignored = 0;
-  let bootstrapped = 0;
+  const newEligibleVideos = [];
 
-  // Oldest first, so alerts show in chronological order.
+  let ignored = 0;
+  let alreadySeen = 0;
+
+  // Oldest first, so digest is chronological.
   for (const video of videos.reverse()) {
-    if (seenVideos.has(video.videoId)) continue;
+    if (seenVideos.has(video.videoId)) {
+      alreadySeen += 1;
+      continue;
+    }
 
     const decision = shouldIgnoreYouTubeVideo(video);
 
@@ -497,44 +522,36 @@ async function checkYouTubeVideos() {
       continue;
     }
 
-    if (isBootstrap) {
-      seenVideos.add(video.videoId);
-      writeJsonSet(SEEN_YOUTUBE_FILE, seenVideos);
-
-      bootstrapped += 1;
-
-      console.log(`Bootstrapped YouTube video silently: ${video.title}`);
-      continue;
-    }
-
-    if (alertsSent >= MAX_YOUTUBE_ALERTS_PER_CHECK) {
-      console.log(
-        `YouTube alert cap reached (${MAX_YOUTUBE_ALERTS_PER_CHECK}). Remaining eligible videos will be processed next check.`
-      );
-      break;
-    }
-
-    // Mark seen BEFORE sending so crashes/rate limits do not cause repeated spam.
-    // Tradeoff: if Discord fails permanently, this video may not alert.
+    // Mark seen immediately so crashes/restarts don't cause duplicate spam.
     seenVideos.add(video.videoId);
     writeJsonSet(SEEN_YOUTUBE_FILE, seenVideos);
 
-    await sendYouTubeAlert(video);
+    newEligibleVideos.push(video);
+  }
 
-    alertsSent += 1;
+  let digestSent = false;
 
-    console.log(`YouTube alert sent: ${video.title}`);
+  if (newEligibleVideos.length > 0) {
+    digestSent = await sendYouTubeDigestAlert(newEligibleVideos);
 
-    // Avoid bursty Discord webhook rate limits.
-    await sleep(1250);
+    if (digestSent) {
+      console.log(`YouTube digest sent with ${newEligibleVideos.length} video(s).`);
+    } else {
+      console.warn(
+        `YouTube digest was not sent, but ${newEligibleVideos.length} video(s) were already marked seen.`
+      );
+    }
+  } else {
+    console.log("No new eligible YouTube videos. No Discord message sent.");
   }
 
   markYouTubeCheckedNow();
 
   status.lastYouTubeCheckAt = new Date().toISOString();
+  status.lastYouTubeDigestCount = newEligibleVideos.length;
 
   console.log(
-    `[${new Date().toISOString()}] Checked YouTube. Returned: ${videos.length}. Alerts: ${alertsSent}. Ignored: ${ignored}. Bootstrapped: ${bootstrapped}.`
+    `[${new Date().toISOString()}] Checked YouTube. Returned: ${videos.length}. New eligible: ${newEligibleVideos.length}. Ignored: ${ignored}. Already seen: ${alreadySeen}.`
   );
 }
 
@@ -584,7 +601,6 @@ async function main() {
   console.log(`Monitoring YouTube query: ${YOUTUBE_QUERY}`);
   console.log(`YouTube min date: ${YOUTUBE_MIN_DATE_VALUE.toISOString()}`);
   console.log(`YouTube title must contain exact text: ${REQUIRED_YOUTUBE_TITLE_TEXT}`);
-  console.log(`YouTube bootstrap silent: ${YOUTUBE_BOOTSTRAP_SILENT_VALUE}`);
   console.log(`YouTube check interval minutes: ${YOUTUBE_CHECK_INTERVAL_MINUTES_VALUE}`);
 
   startHealthServer();
