@@ -37,6 +37,7 @@ const YOUTUBE_CHECK_INTERVAL_MINUTES_VALUE = Number(
 );
 
 const MAX_YOUTUBE_DIGEST_VIDEOS = 10;
+const DISPLAY_TIME_ZONE = "America/Los_Angeles";
 
 let twitchToken = null;
 let twitchTokenExpiresAt = 0;
@@ -115,12 +116,53 @@ function decodeHtmlEntities(text) {
     .replace(/&gt;/g, ">");
 }
 
+function escapeDiscordMarkdown(text) {
+  if (!text) return "";
+
+  return String(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/\*/g, "\\*")
+    .replace(/_/g, "\\_")
+    .replace(/~/g, "\\~")
+    .replace(/`/g, "\\`")
+    .replace(/\|/g, "\\|");
+}
+
+function formatDateForHumans(isoString) {
+  if (!isoString) return "Unknown";
+
+  const date = new Date(isoString);
+
+  if (Number.isNaN(date.getTime())) {
+    return isoString;
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: DISPLAY_TIME_ZONE,
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(date);
+}
+
 function getWebhookDebugLabel() {
   try {
     const url = new URL(DISCORD_WEBHOOK);
     const parts = url.pathname.split("/");
     const webhookId = parts[3] || "unknown";
-    return `webhook_id=${webhookId}`;
+
+    if (url.hostname.includes("pipedream")) {
+      return `relay=pipedream webhook_id=${webhookId}`;
+    }
+
+    if (url.hostname.includes("discord")) {
+      return `relay=direct-discord webhook_id=${webhookId}`;
+    }
+
+    return `relay=${url.hostname} webhook_id=${webhookId}`;
   } catch {
     return "webhook_id=invalid_url";
   }
@@ -128,9 +170,9 @@ function getWebhookDebugLabel() {
 
 function logDiscordResponse(context, res, bodyText) {
   status.lastDiscordStatus = res.status;
-  status.lastDiscordBody = bodyText || "";
+  status.lastDiscordBody = bodyText ? bodyText.slice(0, 500) : "";
 
-  console.log(`${context}: Discord status=${res.status}`);
+  console.log(`${context}: Discord relay status=${res.status}`);
   console.log(`${context}: ${getWebhookDebugLabel()}`);
   console.log(`${context}: x-ratelimit-limit=${res.headers.get("x-ratelimit-limit")}`);
   console.log(`${context}: x-ratelimit-remaining=${res.headers.get("x-ratelimit-remaining")}`);
@@ -138,12 +180,12 @@ function logDiscordResponse(context, res, bodyText) {
   console.log(`${context}: retry-after=${res.headers.get("retry-after")}`);
 
   if (bodyText) {
-    console.log(`${context}: body=${bodyText}`);
+    console.log(`${context}: body=${bodyText.slice(0, 500)}`);
   }
 }
 
 async function sendDiscordPayload(payload, context = "Discord alert") {
-  console.log(`${context}: sending Discord webhook payload.`);
+  console.log(`${context}: sending Discord payload.`);
   console.log(`${context}: ${getWebhookDebugLabel()}`);
 
   const res = await fetch(DISCORD_WEBHOOK, {
@@ -156,12 +198,12 @@ async function sendDiscordPayload(payload, context = "Discord alert") {
   logDiscordResponse(context, res, bodyText);
 
   if (res.ok) {
-    console.log(`${context}: Discord send succeeded.`);
+    console.log(`${context}: send succeeded.`);
     return true;
   }
 
   if (res.status === 429) {
-    console.warn(`${context}: rate limited. Skipping this alert instead of freezing.`);
+    console.warn(`${context}: rate limited. Skipping alert instead of freezing.`);
     return false;
   }
 
@@ -190,8 +232,8 @@ function startHealthServer() {
       }
 
       sendDiscordContent(
-        `Discord test from Render at ${new Date().toISOString()}`,
-        "Minimal Discord test"
+        `Discord relay test from Render at ${formatDateForHumans(new Date().toISOString())}`,
+        "Minimal Discord relay test"
       )
         .then((ok) => {
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -209,7 +251,7 @@ function startHealthServer() {
           );
         })
         .catch((err) => {
-          console.error("Minimal Discord test failed:", err);
+          console.error("Minimal Discord relay test failed:", err);
 
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(
@@ -337,22 +379,25 @@ async function getLiveTwitchStreams() {
 
 async function sendTwitchAlert(stream, isFirstTime) {
   const streamUrl = `https://twitch.tv/${stream.user_login}`;
+  const safeTitle = escapeDiscordMarkdown(stream.title || "No title");
+  const startedAt = formatDateForHumans(stream.started_at);
+
+  const headline = isFirstTime
+    ? "🚨 New creator streaming Rejected Draft"
+    : "🔴 Rejected Draft is live on Twitch";
+
+  const description = [
+    `**[${escapeDiscordMarkdown(stream.user_name)}](${streamUrl})** is live now.`,
+    "",
+    `**Stream title:** ${safeTitle}`,
+    "",
+    `[Watch on Twitch](${streamUrl})`,
+  ].join("\n");
 
   return sendDiscordEmbed(
     {
-      title: isFirstTime
-        ? "🚨 New first-time Rejected Draft streamer!"
-        : "🔴 Rejected Draft streamer is live again!",
-      description: [
-        `**${stream.user_name}** is live now.`,
-        "",
-        `**Title:** ${stream.title || "No title"}`,
-        `**Viewers:** ${stream.viewer_count}`,
-        `**Language:** ${stream.language || "Unknown"}`,
-        "",
-        streamUrl,
-      ].join("\n"),
-      url: streamUrl,
+      title: headline,
+      description,
       color: isFirstTime ? 15158332 : 5763719,
       thumbnail: stream.thumbnail_url
         ? {
@@ -362,10 +407,30 @@ async function sendTwitchAlert(stream, isFirstTime) {
           }
         : undefined,
       fields: [
-        { name: "Streamer", value: stream.user_name, inline: true },
-        { name: "First time?", value: isFirstTime ? "Yes ⭐" : "No", inline: true },
-        { name: "Started at", value: stream.started_at || "Unknown", inline: false },
+        {
+          name: "Status",
+          value: isFirstTime ? "First time detected ⭐" : "Returning streamer",
+          inline: true,
+        },
+        {
+          name: "Viewers",
+          value: String(stream.viewer_count ?? "Unknown"),
+          inline: true,
+        },
+        {
+          name: "Language",
+          value: stream.language || "Unknown",
+          inline: true,
+        },
+        {
+          name: "Started",
+          value: startedAt,
+          inline: false,
+        },
       ],
+      footer: {
+        text: "Rejected Draft stream monitor",
+      },
       timestamp: new Date().toISOString(),
     },
     "Twitch Discord alert"
@@ -489,25 +554,40 @@ function shouldIgnoreYouTubeVideo(video) {
   };
 }
 
-function formatYouTubeDigestDescription(videos) {
-  const includedVideos = videos.slice(0, MAX_YOUTUBE_DIGEST_VIDEOS);
+function formatSingleYouTubeDescription(video) {
+  const url = `https://www.youtube.com/watch?v=${video.videoId}`;
+  const safeTitle = escapeDiscordMarkdown(video.title);
+  const safeChannel = escapeDiscordMarkdown(video.channelTitle);
+  const published = formatDateForHumans(video.publishedAt);
 
+  return [
+    `**[${safeTitle}](${url})**`,
+    "",
+    `**Channel:** ${safeChannel}`,
+    `**Published:** ${published}`,
+    "",
+    `[Watch on YouTube](${url})`,
+  ].join("\n");
+}
+
+function formatMultiYouTubeDigestDescription(videos) {
+  const includedVideos = videos.slice(0, MAX_YOUTUBE_DIGEST_VIDEOS);
   const lines = [];
 
   lines.push(
-    `Found **${videos.length}** new YouTube video${videos.length === 1 ? "" : "s"} matching **${REQUIRED_YOUTUBE_TITLE_TEXT}**.`
+    `Found **${videos.length}** new Rejected Draft YouTube video${videos.length === 1 ? "" : "s"} since the last check.`
   );
-  lines.push("");
-  lines.push(`Cutoff: ${YOUTUBE_MIN_DATE_VALUE.toISOString()}`);
   lines.push("");
 
   for (const [index, video] of includedVideos.entries()) {
     const url = `https://www.youtube.com/watch?v=${video.videoId}`;
+    const safeTitle = escapeDiscordMarkdown(video.title);
+    const safeChannel = escapeDiscordMarkdown(video.channelTitle);
+    const published = formatDateForHumans(video.publishedAt);
 
-    lines.push(`**${index + 1}. ${video.title}**`);
-    lines.push(`Channel: ${video.channelTitle}`);
-    lines.push(`Published: ${video.publishedAt}`);
-    lines.push(`[Open video](${url})`);
+    lines.push(`**${index + 1}. [${safeTitle}](${url})**`);
+    lines.push(`Channel: ${safeChannel}`);
+    lines.push(`Published: ${published}`);
     lines.push("");
   }
 
@@ -530,19 +610,32 @@ async function sendYouTubeDigestAlert(videos) {
   if (videos.length === 0) return false;
 
   const newestVideo = videos[videos.length - 1];
-  const newestUrl = `https://www.youtube.com/watch?v=${newestVideo.videoId}`;
 
-  return sendDiscordEmbed(
-    {
-      title: "📺 New Rejected Draft YouTube videos found",
-      description: formatYouTubeDigestDescription(videos),
-      url: newestUrl,
-      color: 16711680,
-      thumbnail: newestVideo.thumbnail ? { url: newestVideo.thumbnail } : undefined,
-      timestamp: new Date().toISOString(),
-    },
-    "YouTube digest Discord alert"
-  );
+  const isSingleVideo = videos.length === 1;
+
+  const embed = isSingleVideo
+    ? {
+        title: "📺 New Rejected Draft YouTube video",
+        description: formatSingleYouTubeDescription(videos[0]),
+        color: 16711680,
+        thumbnail: videos[0].thumbnail ? { url: videos[0].thumbnail } : undefined,
+        footer: {
+          text: "Rejected Draft YouTube monitor",
+        },
+        timestamp: new Date().toISOString(),
+      }
+    : {
+        title: `📺 ${videos.length} new Rejected Draft YouTube videos`,
+        description: formatMultiYouTubeDigestDescription(videos),
+        color: 16711680,
+        thumbnail: newestVideo.thumbnail ? { url: newestVideo.thumbnail } : undefined,
+        footer: {
+          text: "Rejected Draft YouTube monitor",
+        },
+        timestamp: new Date().toISOString(),
+      };
+
+  return sendDiscordEmbed(embed, "YouTube digest Discord alert");
 }
 
 function shouldCheckYouTubeNow() {
@@ -579,7 +672,7 @@ async function checkYouTubeVideos() {
   let ignored = 0;
   let alreadySeen = 0;
 
-  // Oldest first, so digest is chronological.
+  // Oldest first, so the digest is chronological.
   for (const video of videos.reverse()) {
     if (seenVideos.has(video.videoId)) {
       alreadySeen += 1;
