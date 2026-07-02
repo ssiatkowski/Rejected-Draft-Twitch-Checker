@@ -224,7 +224,8 @@ async function getLiveTwitchStreams() {
 }
 
 async function sendDiscordEmbed(embed, context = "Discord alert") {
-  const maxAttempts = 5;
+  const maxAttempts = 3;
+  const maxWaitMs = 30_000;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const res = await fetch(DISCORD_WEBHOOK, {
@@ -249,6 +250,13 @@ async function sendDiscordEmbed(embed, context = "Discord alert") {
 
       const waitMs = Math.ceil(retryAfterSeconds * 1000) + 500;
 
+      if (waitMs > maxWaitMs) {
+        console.warn(
+          `${context} hit long Discord rate limit (${waitMs}ms). Skipping instead of freezing the app.`
+        );
+        return false;
+      }
+
       console.warn(
         `${context} rate limited. Waiting ${waitMs}ms before retry ${attempt}/${maxAttempts}.`
       );
@@ -260,7 +268,8 @@ async function sendDiscordEmbed(embed, context = "Discord alert") {
     throw new Error(`${context} error ${res.status}: ${bodyText}`);
   }
 
-  throw new Error(`${context} failed after ${maxAttempts} attempts.`);
+  console.warn(`${context} failed after ${maxAttempts} attempts.`);
+  return false;
 }
 
 async function sendTwitchAlert(stream, isFirstTime) {
