@@ -36,6 +36,8 @@ const YOUTUBE_CHECK_INTERVAL_MINUTES_VALUE = Number(
   YOUTUBE_CHECK_INTERVAL_MINUTES || 45
 );
 
+const MAX_YOUTUBE_DIGEST_VIDEOS = 10;
+
 let twitchToken = null;
 let twitchTokenExpiresAt = 0;
 let tickInProgress = false;
@@ -49,6 +51,8 @@ let status = {
   lastTwitchCheckAt: null,
   lastYouTubeCheckAt: null,
   lastYouTubeDigestCount: 0,
+  lastDiscordStatus: null,
+  lastDiscordBody: null,
 };
 
 function requireEnv(name, value) {
@@ -99,10 +103,6 @@ function writeJsonObject(file, obj) {
   fs.writeFileSync(file, JSON.stringify(obj, null, 2));
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function decodeHtmlEntities(text) {
   if (!text) return "";
 
@@ -115,11 +115,118 @@ function decodeHtmlEntities(text) {
     .replace(/&gt;/g, ">");
 }
 
+function getWebhookDebugLabel() {
+  try {
+    const url = new URL(DISCORD_WEBHOOK);
+    const parts = url.pathname.split("/");
+    const webhookId = parts[3] || "unknown";
+    return `webhook_id=${webhookId}`;
+  } catch {
+    return "webhook_id=invalid_url";
+  }
+}
+
+function logDiscordResponse(context, res, bodyText) {
+  status.lastDiscordStatus = res.status;
+  status.lastDiscordBody = bodyText || "";
+
+  console.log(`${context}: Discord status=${res.status}`);
+  console.log(`${context}: ${getWebhookDebugLabel()}`);
+  console.log(`${context}: x-ratelimit-limit=${res.headers.get("x-ratelimit-limit")}`);
+  console.log(`${context}: x-ratelimit-remaining=${res.headers.get("x-ratelimit-remaining")}`);
+  console.log(`${context}: x-ratelimit-reset-after=${res.headers.get("x-ratelimit-reset-after")}`);
+  console.log(`${context}: retry-after=${res.headers.get("retry-after")}`);
+
+  if (bodyText) {
+    console.log(`${context}: body=${bodyText}`);
+  }
+}
+
+async function sendDiscordPayload(payload, context = "Discord alert") {
+  console.log(`${context}: sending Discord webhook payload.`);
+  console.log(`${context}: ${getWebhookDebugLabel()}`);
+
+  const res = await fetch(DISCORD_WEBHOOK, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const bodyText = await res.text();
+  logDiscordResponse(context, res, bodyText);
+
+  if (res.ok) {
+    console.log(`${context}: Discord send succeeded.`);
+    return true;
+  }
+
+  if (res.status === 429) {
+    console.warn(`${context}: rate limited. Skipping this alert instead of freezing.`);
+    return false;
+  }
+
+  throw new Error(`${context} error ${res.status}: ${bodyText}`);
+}
+
+async function sendDiscordEmbed(embed, context = "Discord embed alert") {
+  return sendDiscordPayload({ embeds: [embed] }, context);
+}
+
+async function sendDiscordContent(content, context = "Discord content alert") {
+  return sendDiscordPayload({ content }, context);
+}
+
 function startHealthServer() {
   const port = PORT || 3000;
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
+
+    if (url.pathname === "/test-discord") {
+      if (TICK_SECRET && url.searchParams.get("secret") !== TICK_SECRET) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "Unauthorized" }));
+        return;
+      }
+
+      sendDiscordContent(
+        `Discord test from Render at ${new Date().toISOString()}`,
+        "Minimal Discord test"
+      )
+        .then((ok) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify(
+              {
+                ok,
+                webhookDebug: getWebhookDebugLabel(),
+                lastDiscordStatus: status.lastDiscordStatus,
+                lastDiscordBody: status.lastDiscordBody,
+              },
+              null,
+              2
+            )
+          );
+        })
+        .catch((err) => {
+          console.error("Minimal Discord test failed:", err);
+
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify(
+              {
+                ok: false,
+                error: String(err && err.stack ? err.stack : err),
+                webhookDebug: getWebhookDebugLabel(),
+              },
+              null,
+              2
+            )
+          );
+        });
+
+      return;
+    }
 
     if (url.pathname === "/tick") {
       if (TICK_SECRET && url.searchParams.get("secret") !== TICK_SECRET) {
@@ -131,11 +238,15 @@ function startHealthServer() {
       if (tickInProgress) {
         res.writeHead(202, { "Content-Type": "application/json" });
         res.end(
-          JSON.stringify({
-            ok: true,
-            alreadyRunning: true,
-            status,
-          })
+          JSON.stringify(
+            {
+              ok: true,
+              alreadyRunning: true,
+              status,
+            },
+            null,
+            2
+          )
         );
         return;
       }
@@ -155,7 +266,11 @@ function startHealthServer() {
         {
           ok: true,
           message: "Rejected Draft Twitch + YouTube monitor is running.",
-          usage: "/tick?secret=YOUR_TICK_SECRET",
+          usage: {
+            tick: "/tick?secret=YOUR_TICK_SECRET",
+            testDiscord: "/test-discord?secret=YOUR_TICK_SECRET",
+          },
+          webhookDebug: getWebhookDebugLabel(),
           status,
         },
         null,
@@ -220,59 +335,10 @@ async function getLiveTwitchStreams() {
   return data.data || [];
 }
 
-async function sendDiscordEmbed(embed, context = "Discord alert") {
-  const maxAttempts = 3;
-  const maxWaitMs = 30_000;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const res = await fetch(DISCORD_WEBHOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ embeds: [embed] }),
-    });
-
-    if (res.ok) return true;
-
-    const bodyText = await res.text();
-
-    if (res.status === 429) {
-      let retryAfterSeconds = 1;
-
-      try {
-        const parsed = JSON.parse(bodyText);
-        retryAfterSeconds = Number(parsed.retry_after) || 1;
-      } catch {
-        retryAfterSeconds = Number(res.headers.get("retry-after")) || 1;
-      }
-
-      const waitMs = Math.ceil(retryAfterSeconds * 1000) + 500;
-
-      if (waitMs > maxWaitMs) {
-        console.warn(
-          `${context} hit long Discord rate limit (${waitMs}ms). Skipping instead of freezing the app.`
-        );
-        return false;
-      }
-
-      console.warn(
-        `${context} rate limited. Waiting ${waitMs}ms before retry ${attempt}/${maxAttempts}.`
-      );
-
-      await sleep(waitMs);
-      continue;
-    }
-
-    throw new Error(`${context} error ${res.status}: ${bodyText}`);
-  }
-
-  console.warn(`${context} failed after ${maxAttempts} attempts.`);
-  return false;
-}
-
 async function sendTwitchAlert(stream, isFirstTime) {
   const streamUrl = `https://twitch.tv/${stream.user_login}`;
 
-  await sendDiscordEmbed(
+  return sendDiscordEmbed(
     {
       title: isFirstTime
         ? "🚨 New first-time Rejected Draft streamer!"
@@ -320,12 +386,14 @@ async function checkTwitchStreams() {
 
     const isFirstTime = !seenStreamers.has(stream.user_id);
 
-    await sendTwitchAlert(stream, isFirstTime);
+    const sent = await sendTwitchAlert(stream, isFirstTime);
 
     seenStreamers.add(stream.user_id);
     writeJsonSet(SEEN_TWITCH_FILE, seenStreamers);
 
-    console.log(`Twitch alert sent: ${stream.user_name} | firstTime=${isFirstTime}`);
+    console.log(
+      `Twitch alert attempted: ${stream.user_name} | firstTime=${isFirstTime} | sent=${sent}`
+    );
   }
 
   writeJsonSet(LIVE_TWITCH_FILE, liveNow);
@@ -422,21 +490,29 @@ function shouldIgnoreYouTubeVideo(video) {
 }
 
 function formatYouTubeDigestDescription(videos) {
+  const includedVideos = videos.slice(0, MAX_YOUTUBE_DIGEST_VIDEOS);
+
   const lines = [];
 
-  lines.push(`Found **${videos.length}** new YouTube video${videos.length === 1 ? "" : "s"} matching **${REQUIRED_YOUTUBE_TITLE_TEXT}**.`);
+  lines.push(
+    `Found **${videos.length}** new YouTube video${videos.length === 1 ? "" : "s"} matching **${REQUIRED_YOUTUBE_TITLE_TEXT}**.`
+  );
   lines.push("");
   lines.push(`Cutoff: ${YOUTUBE_MIN_DATE_VALUE.toISOString()}`);
   lines.push("");
 
-  for (const [index, video] of videos.entries()) {
+  for (const [index, video] of includedVideos.entries()) {
     const url = `https://www.youtube.com/watch?v=${video.videoId}`;
 
     lines.push(`**${index + 1}. ${video.title}**`);
     lines.push(`Channel: ${video.channelTitle}`);
     lines.push(`Published: ${video.publishedAt}`);
-    lines.push(url);
+    lines.push(`[Open video](${url})`);
     lines.push("");
+  }
+
+  if (videos.length > includedVideos.length) {
+    lines.push(`Plus ${videos.length - includedVideos.length} more video(s) not shown.`);
   }
 
   let description = lines.join("\n");
@@ -522,10 +598,6 @@ async function checkYouTubeVideos() {
       continue;
     }
 
-    // Mark seen immediately so crashes/restarts don't cause duplicate spam.
-    seenVideos.add(video.videoId);
-    writeJsonSet(SEEN_YOUTUBE_FILE, seenVideos);
-
     newEligibleVideos.push(video);
   }
 
@@ -534,11 +606,17 @@ async function checkYouTubeVideos() {
   if (newEligibleVideos.length > 0) {
     digestSent = await sendYouTubeDigestAlert(newEligibleVideos);
 
+    for (const video of newEligibleVideos) {
+      seenVideos.add(video.videoId);
+    }
+
+    writeJsonSet(SEEN_YOUTUBE_FILE, seenVideos);
+
     if (digestSent) {
       console.log(`YouTube digest sent with ${newEligibleVideos.length} video(s).`);
     } else {
       console.warn(
-        `YouTube digest was not sent, but ${newEligibleVideos.length} video(s) were already marked seen.`
+        `YouTube digest was not sent, but ${newEligibleVideos.length} video(s) were marked seen to avoid repeat spam.`
       );
     }
   } else {
@@ -597,6 +675,7 @@ async function main() {
   ensureFiles();
 
   console.log("Rejected Draft Twitch + YouTube monitor started.");
+  console.log(`Discord webhook debug: ${getWebhookDebugLabel()}`);
   console.log(`Monitoring Twitch game ID: ${TWITCH_GAME_ID}`);
   console.log(`Monitoring YouTube query: ${YOUTUBE_QUERY}`);
   console.log(`YouTube min date: ${YOUTUBE_MIN_DATE_VALUE.toISOString()}`);
