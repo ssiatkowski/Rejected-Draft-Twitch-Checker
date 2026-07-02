@@ -3,15 +3,21 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
-const cron = require("node-cron");
 
 const {
   TWITCH_CLIENT_ID,
   TWITCH_CLIENT_SECRET,
   TWITCH_GAME_ID,
   DISCORD_WEBHOOK,
+
   YOUTUBE_API_KEY,
+  YOUTUBE_CHANNEL_ID,
   YOUTUBE_SEARCH_QUERY,
+  YOUTUBE_MIN_DATE,
+  YOUTUBE_BOOTSTRAP_SILENT,
+  YOUTUBE_CHECK_INTERVAL_MINUTES,
+
+  TICK_SECRET,
   PORT,
 } = process.env;
 
@@ -20,23 +26,37 @@ const DATA_DIR = path.join(__dirname, "data");
 const SEEN_TWITCH_FILE = path.join(DATA_DIR, "seen_streamers.json");
 const LIVE_TWITCH_FILE = path.join(DATA_DIR, "currently_live.json");
 const SEEN_YOUTUBE_FILE = path.join(DATA_DIR, "seen_youtube_videos.json");
+const LAST_YOUTUBE_CHECK_FILE = path.join(DATA_DIR, "last_youtube_check.json");
 
-const YOUTUBE_MIN_DATE = new Date("2026-06-01T00:00:00.000Z");
-
-// Exact capitalization required in title.
 const REQUIRED_YOUTUBE_TITLE_TEXT = "Rejected Draft";
-
-// YouTube query can stay broad; exact filtering happens locally.
 const YOUTUBE_QUERY = YOUTUBE_SEARCH_QUERY || "\"Rejected Draft\"";
+const YOUTUBE_MIN_DATE_VALUE = new Date(
+  YOUTUBE_MIN_DATE || "2026-06-24T00:00:00.000Z"
+);
 
-// Prevent huge bursts on first deploy/redeploy.
+const YOUTUBE_BOOTSTRAP_SILENT_VALUE = YOUTUBE_BOOTSTRAP_SILENT !== "false";
+const YOUTUBE_CHECK_INTERVAL_MINUTES_VALUE = Number(
+  YOUTUBE_CHECK_INTERVAL_MINUTES || 60
+);
+
 const MAX_YOUTUBE_ALERTS_PER_CHECK = 5;
 
 let twitchToken = null;
 let twitchTokenExpiresAt = 0;
+let tickInProgress = false;
+
+let status = {
+  startedAt: new Date().toISOString(),
+  lastTickStartedAt: null,
+  lastTickFinishedAt: null,
+  lastTickSource: null,
+  lastTickError: null,
+  lastTwitchCheckAt: null,
+  lastYouTubeCheckAt: null,
+};
 
 function requireEnv(name, value) {
-  if (!value) throw new Error(`Missing required .env value: ${name}`);
+  if (!value) throw new Error(`Missing required env value: ${name}`);
 }
 
 requireEnv("TWITCH_CLIENT_ID", TWITCH_CLIENT_ID);
@@ -49,6 +69,13 @@ function ensureFiles() {
 
   for (const file of [SEEN_TWITCH_FILE, LIVE_TWITCH_FILE, SEEN_YOUTUBE_FILE]) {
     if (!fs.existsSync(file)) fs.writeFileSync(file, "[]");
+  }
+
+  if (!fs.existsSync(LAST_YOUTUBE_CHECK_FILE)) {
+    fs.writeFileSync(
+      LAST_YOUTUBE_CHECK_FILE,
+      JSON.stringify({ lastCheckedAt: null }, null, 2)
+    );
   }
 }
 
@@ -64,6 +91,18 @@ function writeJsonSet(file, set) {
   fs.writeFileSync(file, JSON.stringify([...set], null, 2));
 }
 
+function readJsonObject(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonObject(file, obj) {
+  fs.writeFileSync(file, JSON.stringify(obj, null, 2));
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -74,22 +113,74 @@ function decodeHtmlEntities(text) {
   return text
     .replace(/&amp;/g, "&")
     .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
     .replace(/&quot;/g, "\"")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">");
 }
 
+function stripCdata(text) {
+  if (!text) return "";
+  return text.replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "");
+}
+
+function extractXmlTag(entry, tagName) {
+  const regex = new RegExp(`<${tagName}[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "i");
+  const match = entry.match(regex);
+  return match ? decodeHtmlEntities(stripCdata(match[1].trim())) : "";
+}
+
+function extractXmlAttribute(entry, tagName, attrName) {
+  const regex = new RegExp(`<${tagName}[^>]*${attrName}="([^"]+)"[^>]*>`, "i");
+  const match = entry.match(regex);
+  return match ? decodeHtmlEntities(match[1]) : "";
+}
+
 function startHealthServer() {
   const port = PORT || 3000;
 
-  http
-    .createServer((req, res) => {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("Rejected Draft Twitch + YouTube monitor is running.\n");
-    })
-    .listen(port, () => {
-      console.log(`Health server listening on port ${port}`);
-    });
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+
+    if (url.pathname === "/tick") {
+      if (TICK_SECRET && url.searchParams.get("secret") !== TICK_SECRET) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "Unauthorized" }));
+        return;
+      }
+
+      if (tickInProgress) {
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, alreadyRunning: true, status }));
+        return;
+      }
+
+      runTick("http /tick").catch((err) => {
+        console.error("Tick failed:", err);
+      });
+
+      res.writeHead(202, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, started: true }));
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify(
+        {
+          ok: true,
+          message: "Rejected Draft Twitch + YouTube monitor is running.",
+          status,
+        },
+        null,
+        2
+      )
+    );
+  });
+
+  server.listen(port, () => {
+    console.log(`Health server listening on port ${port}`);
+  });
 }
 
 async function getTwitchToken() {
@@ -167,7 +258,7 @@ async function sendDiscordEmbed(embed, context = "Discord alert") {
         retryAfterSeconds = Number(res.headers.get("retry-after")) || 1;
       }
 
-      const waitMs = Math.ceil(retryAfterSeconds * 1000) + 250;
+      const waitMs = Math.ceil(retryAfterSeconds * 1000) + 500;
 
       console.warn(
         `${context} rate limited. Waiting ${waitMs}ms before retry ${attempt}/${maxAttempts}.`
@@ -180,7 +271,7 @@ async function sendDiscordEmbed(embed, context = "Discord alert") {
     throw new Error(`${context} error ${res.status}: ${bodyText}`);
   }
 
-  throw new Error(`${context} failed after ${maxAttempts} attempts due to rate limits.`);
+  throw new Error(`${context} failed after ${maxAttempts} attempts.`);
 }
 
 async function sendTwitchAlert(stream, isFirstTime) {
@@ -242,51 +333,126 @@ async function checkTwitchStreams() {
 
   writeJsonSet(LIVE_TWITCH_FILE, liveNow);
 
-  console.log(`[${new Date().toISOString()}] Checked Twitch. Live streams: ${streams.length}`);
+  status.lastTwitchCheckAt = new Date().toISOString();
+
+  console.log(
+    `[${new Date().toISOString()}] Checked Twitch. Live streams: ${streams.length}`
+  );
 }
 
-async function getRecentYouTubeVideos() {
+async function getRecentYouTubeVideosFromRss() {
+  if (!YOUTUBE_CHANNEL_ID) return [];
+
+  const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(
+    YOUTUBE_CHANNEL_ID
+  )}`;
+
+  const res = await fetch(feedUrl);
+
+  if (!res.ok) {
+    throw new Error(`YouTube RSS error ${res.status}: ${await res.text()}`);
+  }
+
+  const xml = await res.text();
+  const entries = xml.match(/<entry>[\s\S]*?<\/entry>/gi) || [];
+
+  return entries
+    .map((entry) => {
+      const videoId = extractXmlTag(entry, "yt:videoId");
+      const title = extractXmlTag(entry, "title");
+      const channelTitle = extractXmlTag(entry, "name") || "YouTube";
+      const publishedAt = extractXmlTag(entry, "published");
+      const thumbnail = extractXmlAttribute(entry, "media:thumbnail", "url");
+
+      return {
+        videoId,
+        title,
+        channelTitle,
+        publishedAt,
+        thumbnail: thumbnail || null,
+        source: "rss",
+      };
+    })
+    .filter((video) => video.videoId && video.title && video.publishedAt);
+}
+
+async function getRecentYouTubeVideosFromApi() {
   if (!YOUTUBE_API_KEY) {
-    console.log("Skipping YouTube check: YOUTUBE_API_KEY not set.");
+    console.log("Skipping YouTube API fallback: YOUTUBE_API_KEY not set.");
     return [];
   }
 
   const params = new URLSearchParams({
     part: "snippet",
-    q: YOUTUBE_QUERY,
     type: "video",
     order: "date",
     maxResults: "25",
-    publishedAfter: "2026-01-01T00:00:00Z",
+    publishedAfter: YOUTUBE_MIN_DATE_VALUE.toISOString(),
     key: YOUTUBE_API_KEY,
   });
+
+  if (YOUTUBE_CHANNEL_ID) {
+    params.set("channelId", YOUTUBE_CHANNEL_ID);
+  } else {
+    params.set("q", YOUTUBE_QUERY);
+  }
 
   const res = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
 
   if (!res.ok) {
-    throw new Error(`YouTube search error ${res.status}: ${await res.text()}`);
+    throw new Error(`YouTube API search error ${res.status}: ${await res.text()}`);
   }
 
   const data = await res.json();
 
   return (data.items || [])
     .filter((item) => item.id && item.id.videoId && item.snippet)
-    .map((item) => {
-      const rawTitle = item.snippet.title || "";
-      const title = decodeHtmlEntities(rawTitle);
+    .map((item) => ({
+      videoId: item.id.videoId,
+      title: decodeHtmlEntities(item.snippet.title || ""),
+      channelTitle: decodeHtmlEntities(item.snippet.channelTitle || "Unknown channel"),
+      publishedAt: item.snippet.publishedAt,
+      thumbnail:
+        item.snippet.thumbnails?.medium?.url ||
+        item.snippet.thumbnails?.default?.url ||
+        null,
+      source: "api",
+    }));
+}
 
-      return {
-        videoId: item.id.videoId,
-        title,
-        rawTitle,
-        channelTitle: decodeHtmlEntities(item.snippet.channelTitle || "Unknown channel"),
-        publishedAt: item.snippet.publishedAt,
-        thumbnail:
-          item.snippet.thumbnails?.medium?.url ||
-          item.snippet.thumbnails?.default?.url ||
-          null,
-      };
-    });
+function dedupeVideos(videos) {
+  const byId = new Map();
+
+  for (const video of videos) {
+    if (!video.videoId) continue;
+    if (!byId.has(video.videoId)) byId.set(video.videoId, video);
+  }
+
+  return [...byId.values()];
+}
+
+async function getRecentYouTubeVideos() {
+  let videos = [];
+
+  if (YOUTUBE_CHANNEL_ID) {
+    try {
+      videos = await getRecentYouTubeVideosFromRss();
+      console.log(`YouTube RSS returned ${videos.length} videos.`);
+    } catch (err) {
+      console.error("YouTube RSS failed:", err);
+    }
+  }
+
+  if (videos.length === 0) {
+    try {
+      videos = await getRecentYouTubeVideosFromApi();
+      console.log(`YouTube API returned ${videos.length} videos.`);
+    } catch (err) {
+      console.error("YouTube API fallback failed:", err);
+    }
+  }
+
+  return dedupeVideos(videos);
 }
 
 function shouldIgnoreYouTubeVideo(video) {
@@ -299,10 +465,10 @@ function shouldIgnoreYouTubeVideo(video) {
     };
   }
 
-  if (publishedDate < YOUTUBE_MIN_DATE) {
+  if (publishedDate < YOUTUBE_MIN_DATE_VALUE) {
     return {
       ignore: true,
-      reason: "before June 2026",
+      reason: `before ${YOUTUBE_MIN_DATE_VALUE.toISOString()}`,
     };
   }
 
@@ -330,6 +496,7 @@ async function sendYouTubeAlert(video) {
         "",
         `**Channel:** ${video.channelTitle}`,
         `**Published:** ${video.publishedAt}`,
+        `**Source:** ${video.source}`,
         "",
         url,
       ].join("\n"),
@@ -342,15 +509,42 @@ async function sendYouTubeAlert(video) {
   );
 }
 
+function shouldCheckYouTubeNow() {
+  ensureFiles();
+
+  const state = readJsonObject(LAST_YOUTUBE_CHECK_FILE, {
+    lastCheckedAt: null,
+  });
+
+  if (!state.lastCheckedAt) return true;
+
+  const last = new Date(state.lastCheckedAt);
+  if (Number.isNaN(last.getTime())) return true;
+
+  const minutesSinceLastCheck = (Date.now() - last.getTime()) / 60_000;
+
+  return minutesSinceLastCheck >= YOUTUBE_CHECK_INTERVAL_MINUTES_VALUE;
+}
+
+function markYouTubeCheckedNow() {
+  writeJsonObject(LAST_YOUTUBE_CHECK_FILE, {
+    lastCheckedAt: new Date().toISOString(),
+  });
+}
+
 async function checkYouTubeVideos() {
   ensureFiles();
 
   const seenVideos = readJsonSet(SEEN_YOUTUBE_FILE);
+  const isBootstrap =
+    YOUTUBE_BOOTSTRAP_SILENT_VALUE && seenVideos.size === 0;
+
   const videos = await getRecentYouTubeVideos();
 
   let alertsSent = 0;
+  let ignored = 0;
+  let bootstrapped = 0;
 
-  // Oldest first, so alert order feels natural.
   for (const video of videos.reverse()) {
     if (seenVideos.has(video.videoId)) continue;
 
@@ -360,7 +554,19 @@ async function checkYouTubeVideos() {
       seenVideos.add(video.videoId);
       writeJsonSet(SEEN_YOUTUBE_FILE, seenVideos);
 
+      ignored += 1;
+
       console.log(`Ignored YouTube video: ${video.title} | reason=${decision.reason}`);
+      continue;
+    }
+
+    if (isBootstrap) {
+      seenVideos.add(video.videoId);
+      writeJsonSet(SEEN_YOUTUBE_FILE, seenVideos);
+
+      bootstrapped += 1;
+
+      console.log(`Bootstrapped YouTube video silently: ${video.title}`);
       continue;
     }
 
@@ -371,9 +577,6 @@ async function checkYouTubeVideos() {
       break;
     }
 
-    // Mark as seen before sending so a crash/rate-limit restart does not spam duplicates.
-    // The tradeoff: if Discord fails permanently, this one video may not alert.
-    // For this use case, avoiding duplicate spam is more important.
     seenVideos.add(video.videoId);
     writeJsonSet(SEEN_YOUTUBE_FILE, seenVideos);
 
@@ -383,45 +586,72 @@ async function checkYouTubeVideos() {
 
     console.log(`YouTube alert sent: ${video.title}`);
 
-    // Small spacing to avoid bursty webhook sends.
     await sleep(1250);
   }
 
+  markYouTubeCheckedNow();
+
+  status.lastYouTubeCheckAt = new Date().toISOString();
+
   console.log(
-    `[${new Date().toISOString()}] Checked YouTube. Returned videos: ${videos.length}. Alerts sent: ${alertsSent}`
+    `[${new Date().toISOString()}] Checked YouTube. Returned: ${videos.length}. Alerts: ${alertsSent}. Ignored: ${ignored}. Bootstrapped: ${bootstrapped}.`
   );
 }
 
+async function runTick(source) {
+  if (tickInProgress) {
+    console.log("Tick skipped because another tick is already running.");
+    return;
+  }
+
+  tickInProgress = true;
+
+  status.lastTickStartedAt = new Date().toISOString();
+  status.lastTickSource = source;
+  status.lastTickError = null;
+
+  console.log(`[${status.lastTickStartedAt}] Tick started from ${source}.`);
+
+  try {
+    await checkTwitchStreams();
+
+    if (shouldCheckYouTubeNow()) {
+      await checkYouTubeVideos();
+    } else {
+      console.log(
+        `Skipping YouTube check. Interval is ${YOUTUBE_CHECK_INTERVAL_MINUTES_VALUE} minutes.`
+      );
+    }
+
+    status.lastTickFinishedAt = new Date().toISOString();
+
+    console.log(`[${status.lastTickFinishedAt}] Tick finished.`);
+  } catch (err) {
+    status.lastTickError = String(err && err.stack ? err.stack : err);
+    status.lastTickFinishedAt = new Date().toISOString();
+
+    console.error("Tick failed:", err);
+  } finally {
+    tickInProgress = false;
+  }
+}
+
 async function main() {
+  ensureFiles();
+
   console.log("Rejected Draft Twitch + YouTube monitor started.");
   console.log(`Monitoring Twitch game ID: ${TWITCH_GAME_ID}`);
-  console.log(`Monitoring YouTube query: ${YOUTUBE_QUERY}`);
+  console.log(`Monitoring YouTube channel ID: ${YOUTUBE_CHANNEL_ID || "not set"}`);
+  console.log(`Monitoring YouTube query fallback: ${YOUTUBE_QUERY}`);
+  console.log(`YouTube min date: ${YOUTUBE_MIN_DATE_VALUE.toISOString()}`);
   console.log(`YouTube title must contain exact text: ${REQUIRED_YOUTUBE_TITLE_TEXT}`);
+  console.log(`YouTube bootstrap silent: ${YOUTUBE_BOOTSTRAP_SILENT_VALUE}`);
+  console.log(`YouTube check interval minutes: ${YOUTUBE_CHECK_INTERVAL_MINUTES_VALUE}`);
 
   startHealthServer();
 
-  await checkTwitchStreams();
-
-  try {
-    await checkYouTubeVideos();
-  } catch (err) {
-    console.error("Initial YouTube check failed:", err);
-  }
-
-  cron.schedule("*/5 * * * *", async () => {
-    try {
-      await checkTwitchStreams();
-    } catch (err) {
-      console.error("Scheduled Twitch check failed:", err);
-    }
-  });
-
-  cron.schedule("0 * * * *", async () => {
-    try {
-      await checkYouTubeVideos();
-    } catch (err) {
-      console.error("Scheduled YouTube check failed:", err);
-    }
+  runTick("startup").catch((err) => {
+    console.error("Startup tick failed:", err);
   });
 }
 
